@@ -1,0 +1,420 @@
+---
+title: "160 Project"
+author: "jolie croissant"
+date: "2026-03-01"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(readr)
+library(data.table)
+library(dplyr)
+icu_path <- "~/physionet.org/files/mimiciv/3.1/icu/"
+hosp_path <- "~/physionet.org/files/mimiciv/3.1/hosp/"
+
+list.files(icu_path)
+list.files(hosp_path)
+icu_stays <- read_csv("~/physionet.org/files/mimiciv/3.1/icu/icustays.csv.gz")
+patients <- read_csv("~/physionet.org/files/mimiciv/3.1/hosp/patients.csv.gz")
+admissions <- read_csv("~/physionet.org/files/mimiciv/3.1/hosp/admissions.csv.gz")
+omr_data <- read_csv("~/physionet.org/files/mimiciv/3.1/hosp/omr.csv.gz")
+diagnoses_dictionary <- read_csv("~/physionet.org/files/mimiciv/3.1/hosp/d_icd_diagnoses.csv.gz")
+diagnoses <- read_csv("~/physionet.org/files/mimiciv/3.1/hosp/diagnoses_icd.csv.gz")
+procedures <- read_csv("~/physionet.org/files/mimiciv/3.1/hosp/procedures_icd.csv.gz")
+fio2_df <- fread("~/physionet.org/files/mimiciv/3.1/icu/fio2_only.csv", select = c(1, 2, 3, 5, 9), 
+                  col.names = c("subject_id", "hadm_id", "stay_id", "charttime", "fio2_val"))
+labs_df <- fread("~/physionet.org/files/mimiciv/3.1/hosp/labs_cci.csv", select = c(2, 3, 7, 9, 5), 
+                  col.names = c("subject_id", "hadm_id", "charttime", "valuenum", "itemid"))
+
+```
+
+
+```{r}
+library(tidyr)
+analysis_df <- diagnoses %>%
+  group_by(subject_id) %>%
+  summarize(
+    is_septic = any(
+      icd_code %in% c("99591", "99592", "R652", "R6520", "R6521") | 
+      startsWith(icd_code, "A40") | 
+      startsWith(icd_code, "A41") |
+      startsWith(icd_code, "T8144")
+    )
+  ) %>%
+  mutate(is_septic = as.numeric(is_septic)) %>%
+  right_join(omr_data, by = "subject_id") %>%
+  mutate(is_septic = replace_na(is_septic, 0))
+
+  analysis_df <- analysis_df %>%
+  mutate(is_obese = ifelse(result_value >= 30, 1, 0))
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(comorbidity)
+diagnoses <- as.data.frame(diagnoses)
+
+cci_data <- comorbidity(x = diagnoses, 
+                       id = "subject_id", 
+                        code = "icd_code", 
+                        map = "charlson_icd10_quan", 
+                        assign0 = TRUE)
+rm(diagnoses)
+cci_data$cci_score <- score(cci_data, weights = "charlson", assign0= TRUE)
+cci_data <- cci_data %>% select(subject_id, cci_score) %>% distinct()
+
+analysis_df <- analysis_df %>%
+  left_join(cci_data, by = "subject_id") %>%
+  mutate(cci_score = replace_na(cci_score, 0))
+
+summary(analysis_df$cci_score)
+```
+
+
+```{r}
+vent_codes <- c("9670", "9671", "9672", "5A1935Z", "5A1945Z", "5A1955Z")
+setDT(procedures)
+procedures[, icd_clean := gsub("\\.", "", icd_code)]
+vent_subjects <- procedures[icd_clean %in% vent_codes, list(is_vent = 1), by = subject_id]
+vent_subjects <- unique(vent_subjects)
+
+outcomes <- admissions[, c("subject_id", "hadm_id", "hospital_expire_flag")]
+colnames(outcomes)[colnames(outcomes) == "hospital_expire_flag"] <- "mortality"
+setDT(admissions)
+stay_info <- admissions[, .(subject_id, hadm_id, admittime, mortality = hospital_expire_flag)]
+
+analysis_df <- analysis_df %>%
+  inner_join(stay_info, by = "subject_id")
+
+setDT(analysis_df)
+analysis_df[, days_from_adm := as.numeric(abs(difftime(chartdate, admittime, units = "days")))]
+
+final_df <- merge(analysis_df, vent_subjects, by = "subject_id", all.x = TRUE)
+final_df[is.na(is_vent), is_vent := 0]
+
+final_df <- final_df[order(subject_id, days_from_adm)] 
+final_df <- final_df[, head(.SD, 1), by = .(subject_id, hadm_id)]
+
+final_df <- final_df[order(subject_id, -mortality, -admittime)]
+final_df <- final_df[, head(.SD, 1), by = subject_id]
+rm(analysis_df)
+rm(final_analysis_unique)
+rm(omr_data)
+rm(procedures)
+```
+
+```{r}
+patients <- patients %>%
+  select(subject_id, gender, anchor_age)
+
+final_df <- final_df %>%
+  left_join(patients, by = "subject_id") %>%
+  rename(age = anchor_age, sex = gender)
+
+final_df <- final_df %>%
+  mutate(sex = ifelse(sex == "M", 1, 0))
+
+final_df <- final_df %>%
+  filter(!is.na(age))
+```
+
+
+
+Matrix Preparation:
+
+```{r}
+library(grf)
+library(data.table)
+
+setDT(final_df)
+
+X_vars <- c("age", "sex", "cci_score", "is_septic", "is_vent")
+X <- as.matrix(final_df[, ..X_vars])
+
+Y <- as.numeric(final_df$mortality)
+W <- as.numeric(final_df$is_obese)
+```
+
+
+Causal Forest Fitting:
+
+```{r}
+set.seed(7)
+library(grf)
+
+# 1. Fit the Causal Forest
+# This builds the 'forest' that estimates the Obesity Paradox
+c_forest <- causal_forest(
+  X = X, 
+  Y = Y, 
+  W = W, 
+  num.trees = 2000,        # More trees = more stable results
+  tune.parameters = "all"  # Automatically optimizes the model
+)
+
+# 2. Extract the CATE (Conditional Average Treatment Effect)
+# This is the "Obesity Paradox Score" for every individual patient
+# Following your reference style:
+final_df[, cate := c_forest$predictions]
+
+# 3. Calculate the Average Treatment Effect (ATE)
+# This provides the overall 'Total Effect' you saw earlier
+ate <- average_treatment_effect(c_forest, target.sample = "all")
+
+print(paste("The Average Treatment Effect (ATE) is:", round(ate["estimate"], 4)))
+print(paste("95% Confidence Interval Standard Error:", round(ate["std.err"], 4)))
+
+```
+```{r}
+calibration <- test_calibration(c_forest)
+print(calibration)
+
+var_imp <- variable_importance(c_forest)
+importance_df <- data.frame(Variable = X_vars, Importance = as.vector(var_imp))
+importance_df[order(-importance_df$Importance), ]
+print("CATE Summary:")
+summary(final_df$cate)
+
+# Check the standard deviation
+print(paste("CATE SD:", round(sd(final_df$cate), 6)))
+```
+```{r}
+set.seed(7)
+c_forest_flexible <- causal_forest(
+  X = X, 
+  Y = Y, 
+  W = W, 
+  num.trees = 4000,
+  min.node.size = 5, 
+  tune.parameters = "all"
+)
+ate_flex <- average_treatment_effect(c_forest_flexible, target.sample = "all")
+
+print(paste("The Average Treatment Effect (ATE) is:", round(ate_flex["estimate"], 4)))
+print(paste("95% Confidence Interval Standard Error:", round(ate_flex["std.err"], 4)))
+# Extract new CATE scores
+final_df[, cate_flex := c_forest_flexible$predictions]
+
+# Check if the range has widened
+print("New CATE Summary (Flexible Forest):")
+summary(final_df$cate_flex)
+
+# Check the new standard deviation
+print(paste("New CATE SD:", sd(final_df$cate_flex)))
+
+```
+
+```{r}
+new_calibration <- test_calibration(c_forest_flexible)
+print(new_calibration)
+
+new_var_imp <- variable_importance(c_forest_flexible)
+new_importance_df <- data.frame(Variable = X_vars, Importance = as.vector(new_var_imp))
+new_importance_df[order(-importance_df$Importance), ]
+
+
+# Check the standard deviation
+sd(final_df$cate)
+sd(final_df$cate_flex)
+```
+
+Introducing New Factors:
+```{r}
+library(lubridate)
+fio2_df <- fio2_df[order(charttime), .(fio2 = first(fio2_val)), by = hadm_id]
+labs_df <- labs_df[itemid %in% c(50821, 50862)]
+labs_df <- labs_df[, .(lab_val = first(valuenum)), by = .(hadm_id, itemid)]
+labs_df <- dcast(labs_df, hadm_id ~ itemid, value.var = "lab_val")
+setnames(labs_df, old = c("50821", "50862"), new = c("pao2", "albumin"), skip_absent = TRUE)
+
+final_df <- final_df %>%
+  left_join(fio2_df, by = "hadm_id") %>%
+  left_join(labs_df, by = "hadm_id")
+
+final_df <- final_df %>%
+  mutate(
+    # 1. Convert to numeric
+    pao2 = as.numeric(pao2),
+    fio2 = as.numeric(fio2),
+    albumin = as.numeric(as.character(albumin)),
+    fio2 = ifelse(fio2 < 21 | is.na(fio2), 21, fio2)
+  ) %>%
+  mutate(
+    fio2_fixed = ifelse(fio2 <= 1, fio2 * 100, fio2),
+    pf_ratio = pao2 / (fio2_fixed / 100)
+  ) %>%
+  mutate(
+    pf_ratio = ifelse(pf_ratio > 500, 500, pf_ratio),
+    pf_ratio = ifelse(is.na(pf_ratio), 400, pf_ratio)
+  ) %>%
+  mutate(
+    pf_ratio = ifelse(is.na(pf_ratio), median(pf_ratio, na.rm = TRUE), pf_ratio),
+    albumin = ifelse(is.na(albumin), median(albumin, na.rm = TRUE), albumin)
+  )
+
+summary(final_df$pf_ratio)
+
+```
+
+Final Causal Forest Fitting
+```{r}
+library(grf)
+set.seed(7)
+
+
+x_vars <- c("age", "sex", "cci_score", "pf_ratio", "albumin", "is_septic", "is_vent")
+
+# 2. Create the matrices
+x <- as.matrix(final_df[, ..x_vars])
+y <- as.numeric(final_df$mortality)
+w <- as.numeric(final_df$is_obese)
+
+
+causalf_model <- causal_forest(X = x, 
+  Y = y, 
+  W = w, 
+  num.trees = 4000,
+  min.node.size = 5, 
+  tune.parameters = "all")
+
+ate_final <- average_treatment_effect(causalf_model, target.sample = "all")
+
+print(paste("The Average Treatment Effect (ATE):", round(ate_final["estimate"], 4)))
+print(paste("95% Confidence Interval Standard Error:", round(ate_final["std.err"], 4)))
+
+check_importance <- variable_importance(causalf_model)
+names(check_importance) <- x_vars
+print(sort(check_importance, decreasing = TRUE))
+test_calibration(causalf_model)
+
+final_df[, cate_final := causalf_model$predictions]
+
+# Check if the range has widened
+print("Final CATE Summary:")
+summary(final_df$cate_final)
+
+# Check the new standard deviation
+print(paste("Final CATE SD:", sd(final_df$cate_final)))
+```
+
+
+```{r}
+
+library(ggplot2)
+ggplot(final_df, aes(x = cci_score, y = cate_final)) +
+  geom_point(alpha = 0.2, color = "blue") +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "Is the Obesity Paradox stronger in sicker patients?",
+       x = "CCI",
+       y = "Predicted Benefit of Obesity (CATE)") +
+  theme_minimal()
+
+ggplot(final_df, aes(x = is_septic, y = cate_final)) +
+  geom_point(alpha = 0.2, color = "blue") +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "Is the Obesity Paradox stronger in septic patients?",
+       x = "is_septic",
+       y = "Predicted Benefit of Obesity (CATE)") +
+  theme_minimal()
+
+ggplot(final_df, aes(x = albumin, y = cate_final)) +
+  geom_point(alpha = 0.2, color = "blue") +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "Is the Obesity Paradox stronger in malnutrition cases?",
+       x = "albumin",
+       y = "Predicted Benefit of Obesity (CATE)") +
+  theme_minimal()
+
+ggplot(final_df, aes(x = is_vent, y = cate_final)) +
+  geom_point(alpha = 0.2, color = "blue") +
+  geom_smooth(method = "lm", color = "red") +
+  labs(title = "Is the Obesity Paradox stronger in ventilated patients?",
+       x = "albumin",
+       y = "Predicted Benefit of Obesity (CATE)") +
+  theme_minimal()
+
+ggplot(final_df, aes(x = cate_final)) +
+  geom_density(fill = "steelblue", alpha = 0.4) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  annotate("text", x = -0.01, y = 50, label = "Protective (Paradox)") +
+  annotate("text", x = 0.02, y = 50, label = "Harmful") +
+  labs(title = "Distribution of the Obesity Paradox Effect",
+       x = "Predicted Effect on Mortality (CATE)",
+       y = "Density") +
+  theme_minimal()
+```
+
+```{r}
+res_dt <- as.data.table(final_df)
+
+cci_te <- res_dt[, list(
+    zte = mean(is_obese), 
+    dev = sd(is_obese) / sqrt(.N), 
+    cnt = .N
+  ), by = c("cci_score")]
+
+
+albumin_te <- res_dt[, list(
+    zte = mean(is_obese), 
+    dev = sd(is_obese) / sqrt(.N), 
+    cnt = .N
+  ), by = c("albumin")]
+
+pf_te <- res_dt[, list(
+    zte = mean(is_obese), 
+    dev = sd(is_obese) / sqrt(.N), 
+    cnt = .N
+  ), by = c("pf_ratio")]
+
+ggplot(cci_te[cnt > 10], aes(x = cci_score, y = zte)) + 
+  geom_line(color = "firebrick", size = 1) +
+  geom_point(color = "firebrick") +
+  geom_ribbon(aes(ymin = zte - 1.96 * dev, ymax = zte + 1.96 * dev), alpha = 0.2, fill = "firebrick") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_bw() +
+  labs(title = "Obesity Benefit by Comorbidity Burden",
+       subtitle = "Values below 0 indicate Obesity is Protective",
+       x = "Charlson Comorbidity Index",
+       y = "Average Treatment Effect (CATE)")
+
+ggplot(albumin_te[cnt > 10], aes(x = albumin, y = zte)) + 
+  geom_line(color = "firebrick", size = 1) +
+  geom_point(color = "firebrick") +
+  geom_ribbon(aes(ymin = zte - 1.96 * dev, ymax = zte + 1.96 * dev), alpha = 0.2, fill = "firebrick") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_bw() +
+  labs(title = "Obesity Benefit by Nutrition Level",
+       subtitle = "Values below 0 indicate Obesity is Protective",
+       x = "Albumin Value",
+       y = "Average Treatment Effect (CATE)")
+
+ggplot(pf_te[cnt > 10], aes(x = pf_ratio, y = zte)) + 
+  geom_line(color = "firebrick", size = 1) +
+  geom_point(color = "firebrick") +
+  geom_ribbon(aes(ymin = zte - 1.96 * dev, ymax = zte + 1.96 * dev), alpha = 0.2, fill = "firebrick") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_bw() +
+  labs(title = "Obesity Benefit by PF Ratio",
+       subtitle = "Values below 0 indicate Obesity is Protective",
+       x = "PF Ratio",
+       y = "Average Treatment Effect (CATE)")
+
+```
+
+
+```{r}
+ggplot(final_df, aes(x = albumin, color = factor(is_obese))) +
+  stat_ecdf() + theme_bw() + 
+  scale_color_discrete(name = "Obese", labels = c("no", "yes"))
+```
+
+
+
+
+
+
+
+
+
+
